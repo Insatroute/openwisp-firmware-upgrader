@@ -12,14 +12,14 @@ setup(
     description="Firmware upgrader module of OpenWISP",
     long_description=open("README.rst").read(),
     url="http://openwisp.org",
-    download_url="https://github.com/openwisp/openwisp-firmware-upgrader/releases",
+    #download_url="https://github.com/openwisp/openwisp-firmware-upgrader/releases",
     platforms=["Platform Independent"],
     keywords=["django", "netjson", "networking", "openwisp", "firmware"],
     packages=find_packages(exclude=["tests*", "docs*"]),
     include_package_data=True,
     zip_safe=False,
     install_requires=[
-        "openwisp-controller @ https://github.com/openwisp/openwisp-controller/tarball/1.2",
+        "git+https://github.com/Insatroute/openwisp-controller.git@main#egg=openwisp_controller,
         "django-private-storage~=3.1.0",
     ],
     classifiers=[
