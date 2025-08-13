@@ -3,4 +3,4 @@ mock-ssh-server~=0.9.1
 responses~=0.25.7
 psycopg2-binary~=2.9.10
 
-git+https://github.com/Insatroute/openwisp-utils.git@main#egg=openwisp_utils[qa,selenium]
+#pip install -e git+https://github.com/Insatroute/openwisp-utils.git@main#egg=openwisp_utils[qa,selenium]
