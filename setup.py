@@ -19,7 +19,6 @@ setup(
     include_package_data=True,
     zip_safe=False,
     install_requires=[
-        "git+https://github.com/Insatroute/openwisp-controller.git@main#egg=openwisp_controller",
         "django-private-storage~=3.1.0",
     ],
     classifiers=[
