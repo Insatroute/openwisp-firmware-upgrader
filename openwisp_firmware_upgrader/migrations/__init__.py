@@ -15,7 +15,7 @@ def create_default_permissions(apps, schema_editor):
 
 def create_permissions_for_default_groups(apps, schema_editor, app_label):
     create_default_permissions(apps, schema_editor)
-    Group = apps.get_model("openwisp_users", "Group")
+    Group = apps.get_model("nexapp_users", "Group")
 
     try:
         admin = Group.objects.get(name="Administrator")
