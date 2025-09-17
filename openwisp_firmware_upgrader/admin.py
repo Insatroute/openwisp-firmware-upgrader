@@ -467,6 +467,28 @@ class DeviceUpgradeOperationInline(ReadonlyUpgradeOptionsMixin, UpgradeOperation
             return self.get_queryset(request, select_related=False).exists()
         return False
 
+from django.contrib import admin
+from django.utils.html import format_html
+from .models import UpgradeOperation
+
+@admin.register(UpgradeOperation)
+class UpgradeOperationAdmin(admin.ModelAdmin):
+    readonly_fields = ("status", "progress_display", "log")
+    list_display = ("device", "status", "progress_display")
+
+    def progress_display(self, obj):
+        return format_html(
+            '<div style="width:120px; border:1px solid #ccc;">'
+            '<div style="width:{}%; background:{}; color:white; text-align:center;">{}%</div>'
+            '</div>',
+            obj.progress,
+            "green" if obj.status == "success"
+            else "orange" if obj.status == "in-progress"
+            else "red",
+            obj.progress,
+        )
+    progress_display.short_description = "Progress"
+
 
 # DeviceAdmin.get_inlines = device_admin_get_inlines
 DeviceAdmin.conditional_inlines += [DeviceFirmwareInline, DeviceUpgradeOperationInline]
