@@ -11,6 +11,7 @@ from django.utils import timezone
 from django.utils.functional import cached_property
 from django.utils.translation import gettext_lazy as _
 from private_storage.fields import PrivateFileField
+from django.utils.timezone import now
 
 from openwisp_controller.connection.exceptions import NoWorkingDeviceConnectionError
 from openwisp_users.mixins import ShareableOrgMixin
@@ -739,11 +740,14 @@ class AbstractUpgradeOperation(UpgradeOptionsMixin, TimeStampedEditableModel):
     @property
     def progress(self):
         """
-        Returns a percentage based on status.
-        Can later be replaced with actual step-based progress.
+        Returns a percentage (0–100) based on status and elapsed time.
+        Simulates progress in steps of 10.
         """
         if self.status == "in-progress":
-            return 50  # can be dynamic later
+            elapsed = (now() - self.modified).total_seconds()
+            step = int(elapsed // 20)  
+            percent = min(10 + step * 10, 60)  
+            return percent
         elif self.status == "success":
             return 100
         elif self.status in ("failed", "aborted"):
