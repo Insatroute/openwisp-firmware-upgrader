@@ -746,7 +746,7 @@ class AbstractUpgradeOperation(UpgradeOptionsMixin, TimeStampedEditableModel):
         if self.status == "in-progress":
             elapsed = (now() - self.modified).total_seconds()
             step = int(elapsed // 20)  
-            percent = min(10 + step * 10, 60)  
+            percent = min(20 + step * 10, 70)  
             return percent
         elif self.status == "success":
             return 100
