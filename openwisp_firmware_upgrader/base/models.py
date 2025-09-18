@@ -592,10 +592,10 @@ class AbstractUpgradeOperation(UpgradeOptionsMixin, TimeStampedEditableModel):
     status = models.CharField(
         max_length=12, choices=STATUS_CHOICES, default=STATUS_CHOICES[0][0]
     )
-    progress = models.PositiveSmallIntegerField(
-        default=0,
-        help_text=_("Progress percentage (0–100) of the upgrade process"),
-    )
+    # progress = models.PositiveSmallIntegerField(
+    #     default=0,
+    #     help_text=_("Progress percentage (0–100) of the upgrade process"),
+    # )
     log = models.TextField(blank=True)
     batch = models.ForeignKey(
         get_model_name("BatchUpgradeOperation"),

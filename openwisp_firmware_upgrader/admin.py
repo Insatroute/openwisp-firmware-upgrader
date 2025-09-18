@@ -468,9 +468,10 @@ class DeviceUpgradeOperationInline(ReadonlyUpgradeOptionsMixin, UpgradeOperation
             return self.get_queryset(request, select_related=False).exists()
         return False
     
-    @admin.display(description=_("Progress"))
+    @admin.display(description="Progress")
     def progress_display(self, obj):
-        # Decide bar color
+        percent = obj.progress  # uses your @property
+        # Choose color based on status
         if obj.status == "success":
             color = "#28a745"  # green
         elif obj.status == "in-progress":
@@ -478,19 +479,19 @@ class DeviceUpgradeOperationInline(ReadonlyUpgradeOptionsMixin, UpgradeOperation
         elif obj.status in ("failed", "aborted"):
             color = "#dc3545"  # red
         else:
-            color = "#6c757d"  # gray (idle/unknown)
+            color = "#6c757d"  # gray
 
         return format_html(
             """
             <div style="width:200px; background:#e9ecef; border-radius:6px; overflow:hidden; box-shadow: inset 0 1px 2px rgba(0,0,0,.1);">
-                <div style="width: {}%; background:{}; color:#fff; text-align:center; padding:2px 0; font-size:12px; font-weight:bold; transition: width 0.6s ease;">
+                <div style="width: {}%; background:{}; color:#fff; text-align:center; padding:2px 0; font-size:12px; font-weight:bold;">
                     {}%
                 </div>
             </div>
             """,
-            obj.progress,
+            percent,
             color,
-            obj.progress,
+            percent,
         )
 
 
