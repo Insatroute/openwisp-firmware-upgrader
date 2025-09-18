@@ -735,3 +735,17 @@ class AbstractUpgradeOperation(UpgradeOptionsMixin, TimeStampedEditableModel):
     @property
     def upgrader_class(self):
         return get_upgrader_class_for_device(self.device)
+    
+    @property
+    def progress(self):
+        """
+        Returns a percentage based on status.
+        Can later be replaced with actual step-based progress.
+        """
+        if self.status == "in-progress":
+            return 50  # can be dynamic later
+        elif self.status == "success":
+            return 100
+        elif self.status in ("failed", "aborted"):
+            return 100
+        return 0
