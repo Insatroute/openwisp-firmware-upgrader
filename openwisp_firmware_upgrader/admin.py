@@ -440,7 +440,6 @@ class DeviceUpgradeOperationInline(ReadonlyUpgradeOptionsMixin, UpgradeOperation
         "device",
         "image",
         "status",
-        "progress_display",
         "log",
         "readonly_upgrade_options",
         "modified",
@@ -467,33 +466,6 @@ class DeviceUpgradeOperationInline(ReadonlyUpgradeOptionsMixin, UpgradeOperation
         if obj:
             return self.get_queryset(request, select_related=False).exists()
         return False
-    
-    @admin.display(description="Progress")
-    def progress_display(self, obj):
-        percent = obj.progress  # uses your @property
-        # Choose color based on status
-        if obj.status == "success":
-            color = "#28a745"  # green
-        elif obj.status == "in-progress":
-            color = "#ffc107"  # yellow
-        elif obj.status in ("failed", "aborted"):
-            color = "#dc3545"  # red
-        else:
-            color = "#6c757d"  # gray
-
-        return format_html(
-            """
-            <div style="width:200px; background:#e9ecef; border-radius:6px; overflow:hidden; box-shadow: inset 0 1px 2px rgba(0,0,0,.1);">
-                <div style="width: {}%; background:{}; color:#fff; text-align:center; padding:2px 0; font-size:12px; font-weight:bold;">
-                    {}%
-                </div>
-            </div>
-            """,
-            percent,
-            color,
-            percent,
-        )
-
 
 
 # DeviceAdmin.get_inlines = device_admin_get_inlines

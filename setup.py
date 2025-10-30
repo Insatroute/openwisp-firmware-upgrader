@@ -11,7 +11,7 @@ setup(
     author_email="support@openwisp.io",
     description="Firmware upgrader module of OpenWISP",
     long_description=open("README.rst").read(),
-    url="http://openwisp.org",
+    #url="http://openwisp.org",
     #download_url="https://github.com/openwisp/openwisp-firmware-upgrader/releases",
     platforms=["Platform Independent"],
     keywords=["django", "netjson", "networking", "openwisp", "firmware"],
@@ -22,7 +22,7 @@ setup(
         "django-private-storage~=3.1.0",
     ],
     classifiers=[
-        "Development Status :: 5 - Production/Stable ",
+        "Development Status :: 5 - Production/Stable",
         "Environment :: Web Environment",
         "Topic :: Internet :: WWW/HTTP",
         "Topic :: System :: Networking",
