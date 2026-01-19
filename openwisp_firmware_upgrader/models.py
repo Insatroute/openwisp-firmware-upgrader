@@ -7,6 +7,7 @@ from .base.models import (
     AbstractDeviceFirmware,
     AbstractFirmwareImage,
     AbstractUpgradeOperation,
+    AbstractDeviceFirmwareSchedule,
 )
 
 
@@ -44,3 +45,9 @@ class UpgradeOperation(AbstractUpgradeOperation):
     class Meta(AbstractUpgradeOperation.Meta):
         abstract = False
         swappable = swappable_setting("firmware_upgrader", "UpgradeOperation")
+
+
+class DeviceFirmwareSchedule(AbstractDeviceFirmwareSchedule):
+    class Meta(AbstractDeviceFirmwareSchedule.Meta):
+        abstract = False
+        swappable = swappable_setting("firmware_upgrader", "DeviceFirmwareSchedule")

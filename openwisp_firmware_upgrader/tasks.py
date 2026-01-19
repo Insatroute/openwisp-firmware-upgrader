@@ -1,5 +1,5 @@
 import logging
-
+from django.utils import timezone
 import swapper
 from celery import shared_task
 from celery.exceptions import SoftTimeLimitExceeded
@@ -22,18 +22,59 @@ logger = logging.getLogger(__name__)
     **app_settings.RETRY_OPTIONS,
 )
 def upgrade_firmware(self, operation_id):
-    """
-    Calls the ``upgrade()`` method of an
-    ``UpgradeOperation`` instance in the background
-    """
+    Schedule = load_model("DeviceFirmwareSchedule")
+
     try:
-        operation = load_model("UpgradeOperation").objects.get(pk=operation_id)
+        operation = (
+            load_model("UpgradeOperation")
+            .objects.select_related("device")
+            .get(pk=operation_id)
+        )
+
+        # mark op running
+        if operation.status == "scheduled":
+            operation.status = "in-progress"
+            operation.save(update_fields=["status", "modified"])
+
+        # mark schedule running (best-effort)
+        try:
+            sched = operation.device.devicefirmware.schedule
+        except Exception:
+            sched = None
+
+        if sched and sched.status in ("scheduled", "pending"):
+            sched.status = "running"
+            sched.started_at = timezone.now()
+            sched.save(update_fields=["status", "started_at", "modified"])
+
         recoverable = self.request.retries < self.max_retries
         operation.upgrade(recoverable=recoverable)
+
+        # mirror final result to schedule
+        if sched:
+            final_map = {
+                "success": "success",
+                "failed": "failed",
+                "aborted": "canceled",
+            }
+            sched.status = final_map.get(operation.status, sched.status)
+            sched.finished_at = timezone.now()
+            sched.save(update_fields=["status", "finished_at", "modified"])
+
     except SoftTimeLimitExceeded:
         operation.status = "failed"
         operation.log_line(_("Operation timed out."))
         logger.warning("SoftTimeLimitExceeded raised in upgrade_firmware task")
+
+        # schedule fail (best-effort)
+        try:
+            sched = operation.device.devicefirmware.schedule
+            sched.status = "failed"
+            sched.finished_at = timezone.now()
+            sched.save(update_fields=["status", "finished_at", "modified"])
+        except Exception:
+            pass
+
     except ObjectDoesNotExist:
         logger.warning(
             f"The UpgradeOperation object with id {operation_id} has been deleted"

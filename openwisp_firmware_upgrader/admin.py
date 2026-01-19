@@ -1,7 +1,11 @@
 import json
 import logging
+import json
+import logging
 from datetime import timedelta
 
+from django.utils import timezone
+from django.utils.formats import date_format
 import reversion
 import swapper
 from django import forms
@@ -38,6 +42,7 @@ logger = logging.getLogger(__name__)
 BatchUpgradeOperation = load_model("BatchUpgradeOperation")
 UpgradeOperation = load_model("UpgradeOperation")
 DeviceFirmware = load_model("DeviceFirmware")
+DeviceFirmwareSchedule = load_model("DeviceFirmwareSchedule")  # ✅ added
 FirmwareImage = load_model("FirmwareImage")
 Category = load_model("Category")
 Build = load_model("Build")
@@ -337,28 +342,73 @@ class BatchUpgradeOperationAdmin(ReadonlyUpgradeOptionsMixin, ReadOnlyAdmin, Bas
 
 class DeviceFirmwareForm(forms.ModelForm):
     upgrade_options = forms.JSONField(widget=FirmwareSchemaWidget, required=False)
+    scheduled_at = forms.SplitDateTimeField(
+        required=False,
+        widget=admin.widgets.AdminSplitDateTime(),
+        help_text=_("If set, firmware upgrade will start at this exact date/time."),
+    )
 
     class Meta:
         model = DeviceFirmware
-        fields = "__all__"
+        fields = ("device", "image", "installed", "upgrade_options", "scheduled_at")
+        
 
     class Media:
         js = ["admin/js/jquery.init.js", "firmware-upgrader/js/device-firmware.js"]
         css = {"all": ["firmware-upgrader/css/device-firmware.css"]}
 
-    def __init__(self, device, *args, **kwargs):
+    def __init__(self, *args, **kwargs):
+        device = kwargs.pop("device", None)
         super().__init__(*args, **kwargs)
-        self.fields["image"].queryset = DeviceFirmware.get_image_queryset_for_device(
-            device, device_firmware=self.instance
-        )
+
+        if device is not None:
+            self.fields["image"].queryset = DeviceFirmware.get_image_queryset_for_device(
+                device, device_firmware=self.instance
+            )
+
+        if self.instance and self.instance.pk:
+            try:
+                self.fields["scheduled_at"].initial = self.instance.schedule.scheduled_at
+            except Exception:
+                pass
+
+    def _normalize_upgrade_options_post(self):
+        """
+        Fix: FirmwareSchemaWidget may submit multiple inputs with the same name
+        (e.g. hidden + textarea), so request.POST contains a list.
+        Django JSONField tries to call .strip() and crashes.
+        """
+        if not hasattr(self, "data") or self.data is None:
+            return
+
+        key = self.add_prefix("upgrade_options")
+        values = self.data.getlist(key)
+        if len(values) <= 1:
+            return
+
+        # pick last non-empty value
+        chosen = ""
+        for v in reversed(values):
+            if v not in (None, "", "null"):
+                chosen = v
+                break
+
+        qd = self.data.copy()  # QueryDict is immutable
+        qd.setlist(key, [chosen])  # force single value
+        self.data = qd
 
     def full_clean(self):
+        # ✅ normalize before Django parses JSONField
+        self._normalize_upgrade_options_post()
+
         super().full_clean()
+
+        # keep your original validation
         if not self.errors and hasattr(self, "cleaned_data"):
             upgrade_op = UpgradeOperation(
                 device=self.cleaned_data["device"],
                 image=self.cleaned_data["image"],
-                upgrade_options=self.cleaned_data["upgrade_options"],
+                upgrade_options=self.cleaned_data.get("upgrade_options") or {},
             )
             try:
                 upgrade_op.full_clean()
@@ -366,14 +416,37 @@ class DeviceFirmwareForm(forms.ModelForm):
                 self.add_error("__all__", error.messages[0])
 
     def save(self, commit=True):
-        """
-        Adapted from ModelForm.save()
-        Passes "upgrade_options to DeviceFirmware.save()
-        """
-        if commit:
-            # If committing, save the instance and the m2m data immediately.
-            self.instance.save(upgrade_options=self.cleaned_data["upgrade_options"])
+        if not commit:
+            return self.instance
+
+        from django.utils import timezone
+
+        scheduled_at = self.cleaned_data.get("scheduled_at")
+        upgrade_options = self.cleaned_data.get("upgrade_options") or {}
+
+        # Make aware if needed (DO NOT localtime it; keep it comparable with timezone.now())
+        if scheduled_at and timezone.is_naive(scheduled_at):
+            scheduled_at = timezone.make_aware(
+                scheduled_at, timezone.get_current_timezone()
+            )
+
+        # This triggers scheduling in the model (transaction.on_commit)
+        self.instance.save(
+            upgrade_options=upgrade_options,
+            scheduled_at=scheduled_at,
+        )
+
+        # Only persist scheduled_at for display; DO NOT touch status/task_id here
+        sched, _ = DeviceFirmwareSchedule.objects.get_or_create(
+            device_firmware=self.instance
+        )
+        if sched.scheduled_at != scheduled_at:
+            sched.scheduled_at = scheduled_at
+            sched.save(update_fields=["scheduled_at"])
+
         return self.instance
+
+
 
 
 class DeviceFormSet(forms.BaseInlineFormSet):
@@ -440,7 +513,8 @@ class DeviceUpgradeOperationInline(ReadonlyUpgradeOptionsMixin, UpgradeOperation
         "device",
         "image",
         "status",
-        "progress_display",
+        # "progress_display",
+        "scheduled_at_display",
         "log",
         "readonly_upgrade_options",
         "modified",
@@ -448,20 +522,69 @@ class DeviceUpgradeOperationInline(ReadonlyUpgradeOptionsMixin, UpgradeOperation
     readonly_fields = fields
 
     def get_queryset(self, request, select_related=True):
-        """
-        Return recent upgrade operations for this device
-        (created within the last 7 days)
-        """
         qs = super().get_queryset(request)
+
         resolved = resolve(request.path_info)
         if "object_id" in resolved.kwargs:
             seven_days = localtime() - timedelta(days=7)
             qs = qs.filter(
-                device_id=resolved.kwargs["object_id"], created__gte=seven_days
+                device_id=resolved.kwargs["object_id"], created__gte=seven_days,
             ).order_by("-created")
-        if select_related:
-            qs = qs.select_related()
-        return qs
+
+        # ✅ Important: pull schedule in same query path
+        return qs.select_related(
+            "device",
+            "image",
+            "device__devicefirmware",
+            "device__devicefirmware__schedule",
+        )
+
+    @admin.display(description="Scheduled at")
+    def scheduled_at_display(self, obj):
+        # show only for scheduled
+        if obj.status != "scheduled":
+            return "-"
+
+        df = getattr(obj.device, "devicefirmware", None)
+        if not df:
+            return "-"
+        sched = getattr(df, "schedule", None)
+        if not sched or not sched.scheduled_at:
+            return "-"
+
+        scheduled_local = timezone.localtime(sched.scheduled_at)
+        now_local = timezone.localtime(timezone.now())
+
+        # remaining time
+        remaining = scheduled_local - now_local
+
+        # if already passed but still marked scheduled
+        if remaining <= timedelta(seconds=0):
+            remaining_txt = "0s"
+        else:
+            total_seconds = int(remaining.total_seconds())
+            days, rem = divmod(total_seconds, 86400)
+            hours, rem = divmod(rem, 3600)
+            minutes, seconds = divmod(rem, 60)
+
+            if days > 0:
+                remaining_txt = f"{days}d {hours}h {minutes}m"
+            elif hours > 0:
+                remaining_txt = f"{hours}h {minutes}m"
+            elif minutes > 0:
+                remaining_txt = f"{minutes}m {seconds}s"
+            else:
+                remaining_txt = f"{seconds}s"
+
+        # show both
+        # return f"{date_format(scheduled_local, 'DATETIME_FORMAT')} (in {remaining_txt})"
+        return format_html(
+        "{} <span style='color:#6b7280;'>(starts in <b>{}</b>)</span>",
+        date_format(scheduled_local, "DATETIME_FORMAT"),
+        remaining_txt,
+    )
+
+
 
     def _get_conditional_queryset(self, request, obj, select_related=False):
         if obj:
@@ -470,6 +593,8 @@ class DeviceUpgradeOperationInline(ReadonlyUpgradeOptionsMixin, UpgradeOperation
     
     @admin.display(description="Progress")
     def progress_display(self, obj):
+        if obj.status == "scheduled":
+            return "-"
         percent = obj.progress  # uses your @property
         # Choose color based on status
         if obj.status == "success":

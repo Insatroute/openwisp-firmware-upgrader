@@ -286,6 +286,7 @@ class AbstractDeviceFirmware(TimeStampedEditableModel):
     )
     image = models.ForeignKey(get_model_name("FirmwareImage"), on_delete=models.CASCADE)
     installed = models.BooleanField(default=False)
+
     _old_image = None
 
     def __init__(self, *args, **kwargs):
@@ -299,6 +300,7 @@ class AbstractDeviceFirmware(TimeStampedEditableModel):
     def clean(self):
         if not hasattr(self, "image") or not hasattr(self, "device"):
             return
+
         if (
             self.image.build.category.organization is not None
             and self.image.build.category.organization != self.device.organization
@@ -311,6 +313,7 @@ class AbstractDeviceFirmware(TimeStampedEditableModel):
                     )
                 }
             )
+
         if self.device.deviceconnection_set.count() < 1:
             raise ValidationError(
                 _(
@@ -319,41 +322,93 @@ class AbstractDeviceFirmware(TimeStampedEditableModel):
                     'please add one in the section named "Credentials"'
                 )
             )
+
         if self.device.model not in self.image.boards:
             raise ValidationError(_("Device model and image model do not match"))
 
-    @property
-    def image_has_changed(self):
-        return self._state.adding or self.image_id != self._old_image.id
-
-    def save(self, batch=None, upgrade=True, upgrade_options=None, *args, **kwargs):
-        # if firwmare image has changed launch upgrade
-        # upgrade won't be launched the first time
-        if upgrade and (self.image_has_changed or not self.installed):
-            self.installed = False
-            super().save(*args, **kwargs)
-            self.create_upgrade_operation(batch, upgrade_options=upgrade_options or {})
-        else:
-            super().save(*args, **kwargs)
-        self._update_old_image()
-
     def _update_old_image(self):
+        # required by __init__ and save() to track changes
         if hasattr(self, "image"):
             self._old_image = self.image
 
-    def create_upgrade_operation(self, batch, upgrade_options=None):
-        uo_model = load_model("UpgradeOperation")
-        operation = uo_model(
-            device=self.device, image=self.image, upgrade_options=upgrade_options
+    @property
+    def image_has_changed(self):
+        # safe when _old_image is None (eg first load / weird init)
+        if self._state.adding or self._old_image is None:
+            return True
+        return self.image_id != self._old_image.id
+
+    def save(
+        self,
+        batch=None,
+        upgrade=True,
+        upgrade_options=None,
+        scheduled_at=None,
+        *args,
+        **kwargs,
+    ):
+        if upgrade and (self.image_has_changed or not self.installed):
+            self.installed = False
+            super().save(*args, **kwargs)
+            self.create_upgrade_operation(
+                batch,
+                upgrade_options=upgrade_options or {},
+                scheduled_at=scheduled_at,
+            )
+        else:
+            super().save(*args, **kwargs)
+
+        self._update_old_image()
+
+    def create_upgrade_operation(self, batch, upgrade_options=None, scheduled_at=None):
+        UpgradeOperation = load_model("UpgradeOperation")
+        Schedule = load_model("DeviceFirmwareSchedule")
+
+        when = scheduled_at
+        if when is None:
+            try:
+                when = self.schedule.scheduled_at
+            except Exception:
+                when = None
+
+        if when and timezone.is_naive(when):
+            when = timezone.make_aware(when, timezone.get_current_timezone())
+
+        now_dt = timezone.now()
+
+        # Create operation with correct initial status
+        op_status = "scheduled" if (when and when > now_dt) else "in-progress"
+
+        operation = UpgradeOperation(
+            device=self.device,
+            image=self.image,
+            upgrade_options=upgrade_options or {},
+            status=op_status,
         )
         if batch:
             operation.batch = batch
         operation.full_clean()
         operation.save()
-        # launch ``upgrade_firmware`` in the background (celery)
-        # once changes are committed to the database
-        transaction.on_commit(lambda: upgrade_firmware.delay(operation.pk))
+
+        def _enqueue():
+            sched, _ = Schedule.objects.get_or_create(device_firmware_id=self.pk)
+
+            # If future: schedule and store task id + status
+            if when and when > timezone.now():
+                res = upgrade_firmware.apply_async(args=[str(operation.pk)], eta=when)
+
+                sched.scheduled_at = when
+                sched.celery_task_id = res.id
+                sched.status = "scheduled"
+                sched.save(update_fields=["scheduled_at", "celery_task_id", "status"])
+                return
+
+            # If no schedule: run now
+            upgrade_firmware.delay(str(operation.pk))
+
+        transaction.on_commit(_enqueue)
         return operation
+
 
     @classmethod
     def create_for_device(cls, device, firmware_image=None):
@@ -579,6 +634,7 @@ class AbstractBatchUpgradeOperation(UpgradeOptionsMixin, TimeStampedEditableMode
 
 class AbstractUpgradeOperation(UpgradeOptionsMixin, TimeStampedEditableModel):
     STATUS_CHOICES = (
+        ("scheduled", _("scheduled")),
         ("in-progress", _("in progress")),
         ("success", _("success")),
         ("failed", _("failed")),
@@ -593,10 +649,6 @@ class AbstractUpgradeOperation(UpgradeOptionsMixin, TimeStampedEditableModel):
     status = models.CharField(
         max_length=12, choices=STATUS_CHOICES, default=STATUS_CHOICES[0][0]
     )
-    # progress = models.PositiveSmallIntegerField(
-    #     default=0,
-    #     help_text=_("Progress percentage (0–100) of the upgrade process"),
-    # )
     log = models.TextField(blank=True)
     batch = models.ForeignKey(
         get_model_name("BatchUpgradeOperation"),
@@ -658,9 +710,8 @@ class AbstractUpgradeOperation(UpgradeOptionsMixin, TimeStampedEditableModel):
             )
             self.save()
             return
+
         installed = False
-        # prevent multiple upgrade operations for
-        # the same device running at the same time
         qs = (
             load_model("UpgradeOperation")
             .objects.filter(device=self.device, status="in-progress")
@@ -673,58 +724,43 @@ class AbstractUpgradeOperation(UpgradeOptionsMixin, TimeStampedEditableModel):
             self.status = "aborted"
             self.save()
             return
+
         upgrader_class = get_upgrader_class_from_device_connection(conn)
         if not upgrader_class:
             return
+
         upgrader = upgrader_class(self, conn)
         try:
             upgrader.upgrade(self.image.file)
-        # this exception is raised when the checksum present in the device
-        # equals the checksum of the image we are trying to flash, which
-        # means the device was aleady flashed previously with the same image
         except UpgradeNotNeeded:
             self.status = "success"
             installed = True
-        # this exception is raised when the test of the image fails,
-        # meaning the image file is corrupted or not apt for flashing
         except UpgradeAborted:
             self.status = "aborted"
-        # raising this exception will cause celery to retry again
-        # the upgrade according to its configuration
         except RecoverableFailure as e:
             self._recoverable_failure_handler(recoverable, e)
-        # failure to reconnect to the device after reflashing or any
-        # other unexpected exception will flag the upgrade as failed
         except (Exception, ReconnectionFailed) as e:
             cause = str(e)
             self.log_line(cause)
             self.status = "failed"
-            # if the reconnection failed we'll add some more info
             if isinstance(e, ReconnectionFailed):
-                # update device connection info
                 conn.is_working = False
                 conn.failure_reason = cause
                 conn.last_attempt = timezone.now()
                 conn.save()
-                # even if the reconnection failed,
-                # the firmware image has been flashed
                 installed = True
-        # if no exception has been raised, the upgrade was successful
         else:
             installed = True
             self.status = "success"
+
         self.save()
-        # if the firmware has been successfully installed,
-        # or if it was already installed
-        # set `instaleld` to `True` on the devicefirmware instance
+
         if installed:
             self.device.devicefirmware.installed = True
             self.device.devicefirmware.save(upgrade=False)
 
     def save(self, *args, **kwargs):
         result = super().save(*args, **kwargs)
-        # when an operation is completed
-        # trigger an update on the batch operation
         if self.batch and self.status != "in-progress":
             self.batch.update()
         return result
@@ -736,20 +772,56 @@ class AbstractUpgradeOperation(UpgradeOptionsMixin, TimeStampedEditableModel):
     @property
     def upgrader_class(self):
         return get_upgrader_class_for_device(self.device)
-    
+
     @property
     def progress(self):
-        """
-        Returns a percentage (0–100) based on status and elapsed time.
-        Simulates progress in steps of 10.
-        """
+        # ✅ scheduled => no progress yet
+        if self.status == "scheduled":
+            return 0
+
         if self.status == "in-progress":
             elapsed = (now() - self.modified).total_seconds()
-            step = int(elapsed // 20)  
-            percent = min(20 + step * 10, 70)  
+            step = int(elapsed // 20)
+            percent = min(20 + step * 10, 70)
             return percent
-        elif self.status == "success":
+        if self.status == "success":
             return 100
-        elif self.status in ("failed", "aborted"):
+        if self.status in ("failed", "aborted"):
             return 100
         return 0
+
+class AbstractDeviceFirmwareSchedule(TimeStampedEditableModel):
+    """
+    Stores scheduling metadata without modifying DeviceFirmware.
+    """
+    device_firmware = models.OneToOneField(
+        get_model_name("DeviceFirmware"),
+        on_delete=models.CASCADE,
+        related_name="schedule",
+    )
+
+    scheduled_at = models.DateTimeField(null=True, blank=True)
+
+    STATUS_CHOICES = (
+        ("pending", _("pending")),
+        ("scheduled", _("scheduled")),
+        ("running", _("running")),
+        ("success", _("success")),
+        ("failed", _("failed")),
+        ("canceled", _("canceled")),
+    )
+    status = models.CharField(
+        max_length=16, choices=STATUS_CHOICES, default=STATUS_CHOICES[0][0]
+    )
+
+    celery_task_id = models.CharField(max_length=255, blank=True, default="")
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        abstract = True
+        verbose_name = _("Device Firmware Schedule")
+        verbose_name_plural = _("Device Firmware Schedules")
+
+    def __str__(self):
+        return f"Schedule for device_firmware {self.device_firmware_id}"
