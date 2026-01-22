@@ -3,7 +3,7 @@ import logging
 import json
 import logging
 from datetime import timedelta
-
+from django.core.exceptions import ValidationError
 from django.utils import timezone
 from django.utils.formats import date_format
 import reversion
@@ -49,6 +49,8 @@ Build = load_model("Build")
 Device = swapper.load_model("config", "Device")
 DeviceConnection = swapper.load_model("connection", "DeviceConnection")
 
+from openwisp_controller.config.models import DeviceGroup
+
 
 class BaseAdmin(MultitenantAdminMixin, TimeReadonlyAdminMixin, admin.ModelAdmin):
     save_on_top = True
@@ -56,8 +58,28 @@ class BaseAdmin(MultitenantAdminMixin, TimeReadonlyAdminMixin, admin.ModelAdmin)
 
 class BaseVersionAdmin(MultitenantAdminMixin, TimeReadonlyAdminMixin, VersionAdmin):
     history_latest_first = True
-    save_on_top = True
+    save_on_top = False
 
+
+# @admin.register(load_model("Category"))
+# class CategoryAdmin(BaseVersionAdmin):
+#     list_display = ["name", "organization", "device_group", "created", "modified"]
+#     list_filter = [MultitenantOrgFilter, "device_group"]
+#     list_select_related = ["organization", "device_group"]
+#     search_fields = ["name"]
+    
+#     ordering = ["-name", "-created"]
+#     fields = ("organization", "device_group", "name", "description", "created", "modified")
+#     def formfield_for_foreignkey(self, db_field, request, **kwargs):
+#         if not request.user.is_superuser:
+#             if db_field.name == "organization":
+#                 kwargs["queryset"] = self._get_org_queryset(request)
+
+#             if db_field.name == "device_group":
+#                 kwargs["queryset"] = DeviceGroup.objects.filter(
+#                     organization__in=self._get_org_queryset(request)
+#                 )
+#         return super().formfield_for_foreignkey(db_field, request, **kwargs)
 
 @admin.register(load_model("Category"))
 class CategoryAdmin(BaseVersionAdmin):
@@ -162,6 +184,14 @@ class BuildAdmin(BaseAdmin):
         upgrade_options = request.POST.get("upgrade_options")
         form = BatchUpgradeConfirmationForm()
         build = queryset.first()
+        device_group = getattr(build.category, "device_group", None)
+        if not device_group:
+            self.message_user(
+                request,
+                _("Please assign a Device Group to this category before mass upgrade."),
+                messages.ERROR,
+            )
+            return None
         # upgrade has been confirmed
         if upgrade_all or upgrade_related:
             form = BatchUpgradeConfirmationForm(
@@ -339,14 +369,44 @@ class BatchUpgradeOperationAdmin(ReadonlyUpgradeOptionsMixin, ReadOnlyAdmin, Bas
     failed_rate.short_description = _("failure rate")
     aborted_rate.short_description = _("abortion rate")
 
+# class AdminSplitDateTimeInline(admin.widgets.AdminSplitDateTime):
+#     def render(self, name, value, attrs=None, renderer=None):
+#         # renders date + time inputs in one row
+#         date_html = self.widgets[0].render(f"{name}_0", value and value[0] if isinstance(value, (list, tuple)) else None, attrs, renderer)
+#         time_html = self.widgets[1].render(f"{name}_1", value and value[1] if isinstance(value, (list, tuple)) else None, attrs, renderer)
 
+#         return format_html(
+#             '<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">{} {}</div>',
+#             date_html,
+#             time_html,
+#         )
 class DeviceFirmwareForm(forms.ModelForm):
     upgrade_options = forms.JSONField(widget=FirmwareSchemaWidget, required=False)
     scheduled_at = forms.SplitDateTimeField(
         required=False,
         widget=admin.widgets.AdminSplitDateTime(),
-        help_text=_("If set, firmware upgrade will start at this exact date/time."),
+        help_text=_(
+            "Choose a date and time to schedule the firmware upgrade. "
+            "If left empty, the upgrade will start immediately."
+        )
     )
+    def clean_scheduled_at(self):
+        dt = self.cleaned_data.get("scheduled_at")
+        if not dt:
+            return dt
+
+        now = timezone.now()
+        max_dt = now + timezone.timedelta(days=15)
+
+        # make aware if needed
+        if timezone.is_naive(dt):
+            dt = timezone.make_aware(dt, timezone.get_current_timezone())
+
+        if dt < now:
+            raise ValidationError(_("Scheduled time must be from now onwards."))
+        if dt > max_dt:
+            raise ValidationError(_("You can schedule only within the next 15 days."))
+        return dt
 
     class Meta:
         model = DeviceFirmware
@@ -398,22 +458,30 @@ class DeviceFirmwareForm(forms.ModelForm):
         self.data = qd
 
     def full_clean(self):
-        # ✅ normalize before Django parses JSONField
         self._normalize_upgrade_options_post()
-
         super().full_clean()
 
-        # keep your original validation
-        if not self.errors and hasattr(self, "cleaned_data"):
-            upgrade_op = UpgradeOperation(
-                device=self.cleaned_data["device"],
-                image=self.cleaned_data["image"],
-                upgrade_options=self.cleaned_data.get("upgrade_options") or {},
-            )
-            try:
-                upgrade_op.full_clean()
-            except forms.ValidationError as error:
-                self.add_error("__all__", error.messages[0])
+        # ✅ If inline is being deleted, do not run custom validation
+        if getattr(self, "cleaned_data", None) and self.cleaned_data.get("DELETE"):
+            return
+
+        if self.errors or not hasattr(self, "cleaned_data"):
+            return
+
+        device = self.cleaned_data.get("device")
+        image = self.cleaned_data.get("image")
+        if not device or not image:
+            return  # ✅ prevents KeyError
+
+        upgrade_op = UpgradeOperation(
+            device=device,
+            image=image,
+            upgrade_options=self.cleaned_data.get("upgrade_options") or {},
+        )
+        try:
+            upgrade_op.full_clean()
+        except forms.ValidationError as error:
+            self.add_error("__all__", error.messages[0])
 
     def save(self, commit=True):
         if not commit:
@@ -455,6 +523,31 @@ class DeviceFormSet(forms.BaseInlineFormSet):
         kwargs["device"] = self.instance
         return kwargs
 
+    def delete_existing(self, obj, commit=True):
+        """
+        Called when inline row is marked for DELETE.
+        If it's a scheduled upgrade -> cancel celery task and clear schedule row.
+        """
+        if getattr(obj, "status", None) == "scheduled":
+            df = getattr(obj.device, "devicefirmware", None)
+            sched = getattr(df, "schedule", None) if df else None
+
+            # revoke celery ETA task (best effort)
+            if sched and sched.celery_task_id:
+                try:
+                    celery_app.control.revoke(sched.celery_task_id, terminate=False)
+                except Exception:
+                    pass
+
+            # clear schedule record
+            if sched:
+                sched.status = "canceled"
+                sched.scheduled_at = None
+                sched.celery_task_id = ""
+                sched.save(update_fields=["status", "scheduled_at", "celery_task_id"])
+
+        return super().delete_existing(obj, commit=commit)
+    
 
 class DeviceFirmwareInline(
     MultitenantAdminMixin, DeactivatedDeviceReadOnlyMixin, admin.StackedInline
@@ -509,6 +602,9 @@ class DeviceUpgradeOperationInline(ReadonlyUpgradeOptionsMixin, UpgradeOperation
     # TODO: remove when this issue solved:
     # https://github.com/theatlantic/django-nested-admin/issues/128#issuecomment-665833142
     sortable_options = {"disabled": True}
+    can_delete = True
+    extra = 0
+    
     fields = [
         "device",
         "image",
@@ -538,6 +634,9 @@ class DeviceUpgradeOperationInline(ReadonlyUpgradeOptionsMixin, UpgradeOperation
             "device__devicefirmware",
             "device__devicefirmware__schedule",
         )
+        
+    def has_delete_permission(self, request, obj=None):
+        return True
 
     @admin.display(description="Scheduled at")
     def scheduled_at_display(self, obj):
