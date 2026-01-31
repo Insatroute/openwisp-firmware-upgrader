@@ -81,19 +81,65 @@ def upgrade_firmware(self, operation_id):
         )
 
 
+# @shared_task(bind=True, soft_time_limit=app_settings.TASK_TIMEOUT)
+# def batch_upgrade_operation(self, batch_id, firmwareless):
+#     """
+#     Calls the ``batch_upgrade()`` method of a
+#     ``Build`` instance in the background
+#     """
+#     try:
+#         batch_operation = load_model("BatchUpgradeOperation").objects.get(pk=batch_id)
+#         batch_operation.upgrade(firmwareless=firmwareless)
+#     except SoftTimeLimitExceeded:
+#         batch_operation.status = "failed"
+#         batch_operation.save()
+#         logger.warning("SoftTimeLimitExceeded raised in batch_upgrade_operation task")
+#     except ObjectDoesNotExist:
+#         logger.warning(
+#             f"The BatchUpgradeOperation object with id {batch_id} has been deleted"
+#         )
+
+from django.utils import timezone
+
 @shared_task(bind=True, soft_time_limit=app_settings.TASK_TIMEOUT)
 def batch_upgrade_operation(self, batch_id, firmwareless):
-    """
-    Calls the ``batch_upgrade()`` method of a
-    ``Build`` instance in the background
-    """
     try:
-        batch_operation = load_model("BatchUpgradeOperation").objects.get(pk=batch_id)
+        BatchUpgradeOperation = load_model("BatchUpgradeOperation")
+        BatchSchedule = load_model("BatchUpgradeOperationSchedule")
+
+        batch_operation = BatchUpgradeOperation.objects.get(pk=batch_id)
+
+        # mark schedule running
+        try:
+            sched = batch_operation.schedule
+            sched.status = "running"
+            sched.started_at = timezone.now()
+            sched.save(update_fields=["status", "started_at"])
+        except Exception:
+            sched = None
+
         batch_operation.upgrade(firmwareless=firmwareless)
+
+        # mark schedule success (batch.update() will mark batch failed/success later)
+        if sched:
+            sched.status = "success"
+            sched.finished_at = timezone.now()
+            sched.save(update_fields=["status", "finished_at"])
+
     except SoftTimeLimitExceeded:
         batch_operation.status = "failed"
-        batch_operation.save()
+        batch_operation.save(update_fields=["status"])
+
+        try:
+            sched = batch_operation.schedule
+            sched.status = "failed"
+            sched.finished_at = timezone.now()
+            sched.save(update_fields=["status", "finished_at"])
+        except Exception:
+            pass
+
         logger.warning("SoftTimeLimitExceeded raised in batch_upgrade_operation task")
+
     except ObjectDoesNotExist:
         logger.warning(
             f"The BatchUpgradeOperation object with id {batch_id} has been deleted"

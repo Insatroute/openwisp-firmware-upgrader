@@ -27,7 +27,7 @@ from reversion.admin import VersionAdmin
 from openwisp_controller.config.admin import DeactivatedDeviceReadOnlyMixin, DeviceAdmin
 from openwisp_users.multitenancy import MultitenantAdminMixin, MultitenantOrgFilter
 from openwisp_utils.admin import ReadOnlyAdmin, TimeReadonlyAdminMixin
-
+from openwisp_firmware_upgrader.tasks import batch_upgrade_operation
 from .filters import (
     BuildCategoryFilter,
     BuildCategoryOrganizationFilter,
@@ -37,6 +37,7 @@ from .filters import (
 from .swapper import load_model
 from .utils import get_upgrader_schema_for_device
 from .widgets import FirmwareSchemaWidget
+from celery import app as celery_app
 
 logger = logging.getLogger(__name__)
 BatchUpgradeOperation = load_model("BatchUpgradeOperation")
@@ -48,8 +49,9 @@ Category = load_model("Category")
 Build = load_model("Build")
 Device = swapper.load_model("config", "Device")
 DeviceConnection = swapper.load_model("connection", "DeviceConnection")
-
-from openwisp_controller.config.models import DeviceGroup
+from django.db import transaction
+from django.utils import timezone
+# from openwisp_controller.config.models import DeviceGroup
 
 
 class BaseAdmin(MultitenantAdminMixin, TimeReadonlyAdminMixin, admin.ModelAdmin):
@@ -58,28 +60,8 @@ class BaseAdmin(MultitenantAdminMixin, TimeReadonlyAdminMixin, admin.ModelAdmin)
 
 class BaseVersionAdmin(MultitenantAdminMixin, TimeReadonlyAdminMixin, VersionAdmin):
     history_latest_first = True
-    save_on_top = False
+    save_on_top = True
 
-
-# @admin.register(load_model("Category"))
-# class CategoryAdmin(BaseVersionAdmin):
-#     list_display = ["name", "organization", "device_group", "created", "modified"]
-#     list_filter = [MultitenantOrgFilter, "device_group"]
-#     list_select_related = ["organization", "device_group"]
-#     search_fields = ["name"]
-    
-#     ordering = ["-name", "-created"]
-#     fields = ("organization", "device_group", "name", "description", "created", "modified")
-#     def formfield_for_foreignkey(self, db_field, request, **kwargs):
-#         if not request.user.is_superuser:
-#             if db_field.name == "organization":
-#                 kwargs["queryset"] = self._get_org_queryset(request)
-
-#             if db_field.name == "device_group":
-#                 kwargs["queryset"] = DeviceGroup.objects.filter(
-#                     organization__in=self._get_org_queryset(request)
-#                 )
-#         return super().formfield_for_foreignkey(db_field, request, **kwargs)
 
 @admin.register(load_model("Category"))
 class CategoryAdmin(BaseVersionAdmin):
@@ -118,16 +100,63 @@ class FirmwareImageInline(TimeReadonlyAdminMixin, admin.StackedInline):
             return False
         return True
 
+from django import forms
+class AdminSplitDateTimePicker(forms.SplitDateTimeWidget):
+    def __init__(self, attrs=None):
+        super().__init__(attrs=attrs)
+
+        # date input (adds right margin)
+        self.widgets[0] = forms.DateInput(
+            attrs={
+                "type": "date",
+                "style": "width:170px; margin-left:12px;",  # ✅ spacing
+            }
+        )
+
+        # time input
+        self.widgets[1] = forms.TimeInput(
+            attrs={
+                "type": "time",
+                "step": "60",
+                "style": "width:170px; margin-left:12px;",  # keep clean
+            },
+            format="%H:%M",
+        )
 
 class BatchUpgradeConfirmationForm(forms.ModelForm):
     upgrade_options = forms.JSONField(widget=FirmwareSchemaWidget(), required=False)
+    scheduled_at = forms.SplitDateTimeField(
+        required=False,
+        widget=AdminSplitDateTimePicker(),
+        help_text=_(
+            "Choose a date and time to schedule the firmware upgrade for all devices. "
+            "If left empty, the upgrade will start immediately."
+        )
+    )
     build = forms.ModelChoiceField(
         widget=forms.HiddenInput(), required=False, queryset=Build.objects.all()
     )
 
     class Meta:
         model = BatchUpgradeOperation
-        fields = ("build", "upgrade_options")
+        fields = ("build", "upgrade_options", "scheduled_at")
+        
+    def clean_scheduled_at(self):
+        dt = self.cleaned_data.get("scheduled_at")
+        if not dt:
+            return dt
+
+        now = timezone.now()
+        max_dt = now + timezone.timedelta(days=15)
+
+        if timezone.is_naive(dt):
+            dt = timezone.make_aware(dt, timezone.get_current_timezone())
+
+        if dt < now:
+            raise ValidationError(_("Scheduled time must be from now onwards."))
+        if dt > max_dt:
+            raise ValidationError(_("You can schedule only within the next 15 days."))
+        return dt
 
     @property
     def media(self):
@@ -152,7 +181,17 @@ class BuildAdmin(BaseAdmin):
 
     # Allows apps that extend this modules to use this template with less hacks
     change_form_template = "admin/firmware_upgrader/change_form.html"
+    
+    def _schedule_batch_upgrade(self, batch, scheduled_at, firmwareless):
+        if timezone.is_naive(scheduled_at):
+            scheduled_at = timezone.make_aware(scheduled_at, timezone.get_current_timezone())
 
+        transaction.on_commit(
+            lambda: batch_upgrade_operation.apply_async(
+                args=[str(batch.pk), firmwareless],
+                eta=scheduled_at,
+            )
+        )
     def organization(self, obj):
         return obj.category.organization
 
@@ -162,12 +201,103 @@ class BuildAdmin(BaseAdmin):
         description=_("Mass-upgrade devices related to the selected build"),
         permissions=["change"],
     )
+    # def upgrade_selected(self, request, queryset):
+    #     opts = self.model._meta
+    #     app_label = opts.app_label
+    #     # multiple concurrent batch upgrades are not supported
+    #     # (it's not yet possible to select more builds and upgrade
+    #     #  all of them at the same time)
+    #     if queryset.count() > 1:
+    #         self.message_user(
+    #             request,
+    #             _(
+    #                 "Multiple mass upgrades requested but at the moment only "
+    #                 "a single mass upgrade operation at time is supported."
+    #             ),
+    #             messages.ERROR,
+    #         )
+    #         # returning None will display the change list page again
+    #         return None
+    #     upgrade_all = request.POST.get("upgrade_all")
+    #     upgrade_related = request.POST.get("upgrade_related")
+    #     upgrade_options = request.POST.get("upgrade_options")
+    #     form = BatchUpgradeConfirmationForm()
+    #     build = queryset.first()
+    #     # upgrade has been confirmed
+    #     if upgrade_all or upgrade_related:
+    #         scheduled_at_0 = request.POST.get("scheduled_at_0")  # date part
+    #         scheduled_at_1 = request.POST.get("scheduled_at_1")  # time part
+    #         form = BatchUpgradeConfirmationForm(
+    #             data={"upgrade_options": upgrade_options, "build": build.pk, "scheduled_at_0": scheduled_at_0,
+    #         "scheduled_at_1": scheduled_at_1,}
+    #         )
+    #         form.full_clean()
+    #         if not form.errors:
+    #             upgrade_options = form.cleaned_data["upgrade_options"]
+    #             scheduled_at = form.cleaned_data["scheduled_at"]
+    #             batch = build.batch_upgrade(
+    #                 firmwareless=upgrade_all,
+    #                 upgrade_options=upgrade_options,
+    #             )
+
+    #             scheduled_at = form.cleaned_data.get("scheduled_at")
+    #             firmwareless = bool(upgrade_all)  # upgrade_all => include firmwareless devices
+    #             if scheduled_at:
+    #                 self._schedule_batch_upgrade(batch, scheduled_at, firmwareless)
+
+    #             text = _(
+    #                 "You can track the progress of this mass upgrade operation "
+    #                 "in this page. Refresh the page from time to time to check "
+    #                 "its progress."
+    #             )
+    #             self.message_user(request, mark_safe(text), messages.SUCCESS)
+    #             url = reverse(
+    #                 f"admin:{app_label}_batchupgradeoperation_change", args=[batch.pk]
+    #             )
+    #             return redirect(url)
+    #     # upgrade needs to be confirmed
+    #     result = BatchUpgradeOperation.dry_run(build=build)
+    #     related_device_fw = result["device_firmwares"]
+    #     firmwareless_devices = result["devices"]
+    #     title = _("Confirm mass upgrade operation")
+    #     context = self.admin_site.each_context(request)
+    #     upgrader_schema = BatchUpgradeOperation(build=build)._get_upgrader_schema(
+    #         related_device_fw=related_device_fw,
+    #         firmwareless_devices=firmwareless_devices,
+    #     )
+
+    #     context.update(
+    #         {
+    #             "title": title,
+    #             "related_device_fw": related_device_fw,
+    #             "related_count": len(related_device_fw),
+    #             "firmwareless_devices": firmwareless_devices,
+    #             "firmwareless_count": len(firmwareless_devices),
+    #             "form": form,
+    #             "firmware_upgrader_schema": json.dumps(
+    #                 upgrader_schema, cls=DjangoJSONEncoder
+    #             ),
+    #             "build": build,
+    #             "opts": opts,
+    #             "action_checkbox_name": ACTION_CHECKBOX_NAME,
+    #             "media": self.media,
+    #         }
+    #     )
+    #     request.current_app = self.admin_site.name
+    #     return TemplateResponse(
+    #         request,
+    #         [
+    #             "admin/%s/%s/upgrade_selected_confirmation.html"
+    #             % (app_label, opts.model_name),
+    #             "admin/%s/upgrade_selected_confirmation.html" % app_label,
+    #             "admin/upgrade_selected_confirmation.html",
+    #         ],
+    #         context,
+    #     )
     def upgrade_selected(self, request, queryset):
         opts = self.model._meta
         app_label = opts.app_label
-        # multiple concurrent batch upgrades are not supported
-        # (it's not yet possible to select more builds and upgrade
-        #  all of them at the same time)
+
         if queryset.count() > 1:
             self.message_user(
                 request,
@@ -177,31 +307,38 @@ class BuildAdmin(BaseAdmin):
                 ),
                 messages.ERROR,
             )
-            # returning None will display the change list page again
             return None
         upgrade_all = request.POST.get("upgrade_all")
         upgrade_related = request.POST.get("upgrade_related")
-        upgrade_options = request.POST.get("upgrade_options")
-        form = BatchUpgradeConfirmationForm()
+        upgrade_options_raw = request.POST.get("upgrade_options")
         build = queryset.first()
-        device_group = getattr(build.category, "device_group", None)
-        if not device_group:
-            self.message_user(
-                request,
-                _("Please assign a Device Group to this category before mass upgrade."),
-                messages.ERROR,
-            )
-            return None
-        # upgrade has been confirmed
+
+        # ✅ POST: confirmed
         if upgrade_all or upgrade_related:
+            scheduled_at_0 = request.POST.get("scheduled_at_0")
+            scheduled_at_1 = request.POST.get("scheduled_at_1")
             form = BatchUpgradeConfirmationForm(
-                data={"upgrade_options": upgrade_options, "build": build}
+                data={
+                    "upgrade_options": upgrade_options_raw,
+                    "build": build.pk,
+                    "scheduled_at_0": scheduled_at_0,
+                    "scheduled_at_1": scheduled_at_1,
+                }
             )
             form.full_clean()
             if not form.errors:
-                upgrade_options = form.cleaned_data["upgrade_options"]
+                upgrade_options = form.cleaned_data.get("upgrade_options") or {}
+                scheduled_at = form.cleaned_data.get("scheduled_at")
+
+                firmwareless = bool(upgrade_all)  # upgrade_all => includes firmwareless
+
+                # ✅ IMPORTANT:
+                # If scheduled_at exists -> call scheduled batch_upgrade
+                # else -> call immediate batch_upgrade
                 batch = build.batch_upgrade(
-                    firmwareless=upgrade_all, upgrade_options=upgrade_options
+                    firmwareless=firmwareless,
+                    upgrade_options=upgrade_options,
+                    scheduled_at=scheduled_at,   # ✅ your patched Build.batch_upgrade supports this
                 )
                 text = _(
                     "You can track the progress of this mass upgrade operation "
@@ -213,7 +350,12 @@ class BuildAdmin(BaseAdmin):
                     f"admin:{app_label}_batchupgradeoperation_change", args=[batch.pk]
                 )
                 return redirect(url)
-        # upgrade needs to be confirmed
+
+            # if form invalid -> fall through and re-render confirmation below
+        else:
+            form = BatchUpgradeConfirmationForm()
+
+        # ✅ GET: show confirmation page
         result = BatchUpgradeOperation.dry_run(build=build)
         related_device_fw = result["device_firmwares"]
         firmwareless_devices = result["devices"]
@@ -245,14 +387,12 @@ class BuildAdmin(BaseAdmin):
         return TemplateResponse(
             request,
             [
-                "admin/%s/%s/upgrade_selected_confirmation.html"
-                % (app_label, opts.model_name),
+                "admin/%s/%s/upgrade_selected_confirmation.html" % (app_label, opts.model_name),
                 "admin/%s/upgrade_selected_confirmation.html" % app_label,
                 "admin/upgrade_selected_confirmation.html",
             ],
             context,
         )
-
     upgrade_selected.short_description = (
         "Mass-upgrade devices related " "to the selected build"
     )
@@ -321,6 +461,7 @@ class BatchUpgradeOperationAdmin(ReadonlyUpgradeOptionsMixin, ReadOnlyAdmin, Bas
     fields = [
         "build",
         "status",
+        "scheduled_at_display",
         "completed",
         "success_rate",
         "failed_rate",
@@ -331,6 +472,7 @@ class BatchUpgradeOperationAdmin(ReadonlyUpgradeOptionsMixin, ReadOnlyAdmin, Bas
     ]
     autocomplete_fields = ["build"]
     readonly_fields = [
+        "scheduled_at_display",
         "completed",
         "success_rate",
         "failed_rate",
@@ -364,27 +506,108 @@ class BatchUpgradeOperationAdmin(ReadonlyUpgradeOptionsMixin, ReadOnlyAdmin, Bas
             return f"{value}%"
         return "N/A"
 
+    # @admin.display(description="Scheduled at")
+    # def scheduled_at_display(self, obj):
+    #     # schedule comes from BatchUpgradeOperationSchedule (OneToOne)
+    #     sched = getattr(obj, "schedule", None)
+    #     if not sched or not sched.scheduled_at:
+    #         return "-"
+
+    #     # show only if it is actually scheduled (future or status scheduled)
+    #     scheduled_dt = sched.scheduled_at
+    #     if timezone.is_naive(scheduled_dt):
+    #         scheduled_dt = timezone.make_aware(scheduled_dt, timezone.get_current_timezone())
+
+    #     scheduled_local = timezone.localtime(scheduled_dt)
+    #     now_local = timezone.localtime(timezone.now())
+
+    #     remaining = scheduled_local - now_local
+
+    #     # if already running or past time
+    #     if remaining <= timedelta(seconds=0):
+    #         # If you want: show running/started instead of "-"
+    #         return format_html(
+    #             "{} <span style='color:#6b7280;'>(status: <b>{}</b>)</span>",
+    #             date_format(scheduled_local, "DATETIME_FORMAT"),
+    #             sched.status,
+    #         )
+
+    #     total_seconds = int(remaining.total_seconds())
+    #     days, rem = divmod(total_seconds, 86400)
+    #     hours, rem = divmod(rem, 3600)
+    #     minutes, seconds = divmod(rem, 60)
+
+    #     if days > 0:
+    #         remaining_txt = f"{days}d {hours}h {minutes}m"
+    #     elif hours > 0:
+    #         remaining_txt = f"{hours}h {minutes}m"
+    #     elif minutes > 0:
+    #         remaining_txt = f"{minutes}m {seconds}s"
+    #     else:
+    #         remaining_txt = f"{seconds}s"
+
+    #     return format_html(
+    #         "{} <span style='color:#6b7280;'>(starts in <b>{}</b>, status: <b>{}</b>)</span>",
+    #         date_format(scheduled_local, "DATETIME_FORMAT"),
+    #         remaining_txt,
+    #         sched.status,
+    #     )
+    @admin.display(description="Scheduled at")
+    def scheduled_at_display(self, obj):
+        # ✅ show only for scheduled batch
+        if getattr(obj, "status", None) != "scheduled":
+            return "-"
+
+        # schedule comes from BatchUpgradeOperationSchedule (OneToOne)
+        sched = getattr(obj, "schedule", None)
+        if not sched or not sched.scheduled_at:
+            return "-"
+
+        scheduled_dt = sched.scheduled_at
+        if timezone.is_naive(scheduled_dt):
+            scheduled_dt = timezone.make_aware(
+                scheduled_dt, timezone.get_current_timezone()
+            )
+
+        scheduled_local = timezone.localtime(scheduled_dt)
+        now_local = timezone.localtime(timezone.now())
+
+        remaining = scheduled_local - now_local
+
+        if remaining <= timedelta(seconds=0):
+            remaining_txt = "0s"
+        else:
+            total_seconds = int(remaining.total_seconds())
+            days, rem = divmod(total_seconds, 86400)
+            hours, rem = divmod(rem, 3600)
+            minutes, seconds = divmod(rem, 60)
+
+            if days > 0:
+                remaining_txt = f"{days}d {hours}h {minutes}m"
+            elif hours > 0:
+                remaining_txt = f"{hours}h {minutes}m"
+            elif minutes > 0:
+                remaining_txt = f"{minutes}m {seconds}s"
+            else:
+                remaining_txt = f"{seconds}s"
+
+        return format_html(
+            "{} <span style='color:#6b7280;'>(starts in <b>{}</b>)</span>",
+            date_format(scheduled_local, "DATETIME_FORMAT"),
+            remaining_txt,
+        )
+        
     completed.short_description = _("completed")
     success_rate.short_description = _("success rate")
     failed_rate.short_description = _("failure rate")
     aborted_rate.short_description = _("abortion rate")
 
-# class AdminSplitDateTimeInline(admin.widgets.AdminSplitDateTime):
-#     def render(self, name, value, attrs=None, renderer=None):
-#         # renders date + time inputs in one row
-#         date_html = self.widgets[0].render(f"{name}_0", value and value[0] if isinstance(value, (list, tuple)) else None, attrs, renderer)
-#         time_html = self.widgets[1].render(f"{name}_1", value and value[1] if isinstance(value, (list, tuple)) else None, attrs, renderer)
-
-#         return format_html(
-#             '<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">{} {}</div>',
-#             date_html,
-#             time_html,
-#         )
 class DeviceFirmwareForm(forms.ModelForm):
     upgrade_options = forms.JSONField(widget=FirmwareSchemaWidget, required=False)
     scheduled_at = forms.SplitDateTimeField(
         required=False,
-        widget=admin.widgets.AdminSplitDateTime(),
+        # widget=admin.widgets.AdminSplitDateTime(),
+        widget=AdminSplitDateTimePicker(),
         help_text=_(
             "Choose a date and time to schedule the firmware upgrade. "
             "If left empty, the upgrade will start immediately."
@@ -523,28 +746,43 @@ class DeviceFormSet(forms.BaseInlineFormSet):
         kwargs["device"] = self.instance
         return kwargs
 
+    # def delete_existing(self, obj, commit=True):
+    #     """
+    #     Called when inline row is marked for DELETE.
+    #     If it's a scheduled upgrade -> cancel celery task and clear schedule row.
+    #     """
+    #     if getattr(obj, "status", None) == "scheduled":
+    #         df = getattr(obj.device, "devicefirmware", None)
+    #         sched = getattr(df, "schedule", None) if df else None
+
+    #         # revoke celery ETA task (best effort)
+    #         if sched and sched.celery_task_id:
+    #             try:
+    #                 celery_app.control.revoke(sched.celery_task_id, terminate=False)
+    #             except Exception:
+    #                 pass
+
+    #         # clear schedule record
+    #         if sched:
+    #             sched.status = "canceled"
+    #             sched.scheduled_at = None
+    #             sched.celery_task_id = ""
+    #             sched.save(update_fields=["status", "scheduled_at", "celery_task_id"])
+    #     return super().delete_existing(obj, commit=commit)
     def delete_existing(self, obj, commit=True):
-        """
-        Called when inline row is marked for DELETE.
-        If it's a scheduled upgrade -> cancel celery task and clear schedule row.
-        """
-        if getattr(obj, "status", None) == "scheduled":
-            df = getattr(obj.device, "devicefirmware", None)
-            sched = getattr(df, "schedule", None) if df else None
+        # obj is DeviceFirmware
+        sched = getattr(obj, "schedule", None)
 
-            # revoke celery ETA task (best effort)
-            if sched and sched.celery_task_id:
-                try:
-                    celery_app.control.revoke(sched.celery_task_id, terminate=False)
-                except Exception:
-                    pass
+        if sched and sched.status == "scheduled" and sched.celery_task_id:
+            try:
+                celery_app.control.revoke(sched.celery_task_id, terminate=False)
+            except Exception:
+                pass
 
-            # clear schedule record
-            if sched:
-                sched.status = "canceled"
-                sched.scheduled_at = None
-                sched.celery_task_id = ""
-                sched.save(update_fields=["status", "scheduled_at", "celery_task_id"])
+            sched.status = "canceled"
+            sched.scheduled_at = None
+            sched.celery_task_id = ""
+            sched.save(update_fields=["status", "scheduled_at", "celery_task_id"])
 
         return super().delete_existing(obj, commit=commit)
     

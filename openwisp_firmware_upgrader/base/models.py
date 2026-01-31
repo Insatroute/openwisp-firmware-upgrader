@@ -42,6 +42,9 @@ from ..utils import (
     get_upgrader_class_from_device_connection,
     get_upgrader_schema_for_device,
 )
+# from swapper import load_model
+from openwisp_controller.config.models import DeviceGroup
+
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +77,12 @@ class UpgradeOptionsMixin(models.Model):
 class AbstractCategory(ShareableOrgMixin, TimeStampedEditableModel):
     name = models.CharField(max_length=64, db_index=True)
     description = models.TextField(blank=True)
+    # device_group = models.ForeignKey(
+    #     DeviceGroup,
+    #     on_delete=models.PROTECT,
+    #     related_name="firmware_categories",
+    #     null=True, blank=True,
+    # )
 
     def __str__(self):
         return self.name
@@ -82,6 +91,7 @@ class AbstractCategory(ShareableOrgMixin, TimeStampedEditableModel):
         abstract = True
         verbose_name = _("Firmware Category")
         verbose_name_plural = _("Firmware Categories")
+        # unique_together = ("name", "organization", "device_group")
         unique_together = ("name", "organization")
 
 
@@ -155,17 +165,47 @@ class AbstractBuild(TimeStampedEditableModel):
                 }
             )
 
-    def batch_upgrade(self, firmwareless, upgrade_options=None):
+    def batch_upgrade(self, firmwareless, upgrade_options=None, scheduled_at=None):
         upgrade_options = upgrade_options or {}
-        batch = load_model("BatchUpgradeOperation")(
-            build=self, upgrade_options=upgrade_options
-        )
+
+        BatchUpgradeOperation = load_model("BatchUpgradeOperation")
+        BatchSchedule = load_model("BatchUpgradeOperationSchedule")
+
+        batch = BatchUpgradeOperation(build=self, upgrade_options=upgrade_options)
         batch.full_clean()
         batch.save()
-        transaction.on_commit(
-            lambda: batch_upgrade_operation.delay(batch.pk, firmwareless)
-        )
+
+        def _enqueue():
+            # ensure schedule row exists (OneToOne)
+            sched, _ = BatchSchedule.objects.get_or_create(batch_operation=batch)
+
+            when = scheduled_at
+            if when and timezone.is_naive(when):
+                when = timezone.make_aware(when, timezone.get_current_timezone())
+
+            # if scheduled in future -> eta
+            if when and when > timezone.now():
+                res = batch_upgrade_operation.apply_async(
+                    args=[str(batch.pk), firmwareless],
+                    eta=when,
+                )
+                sched.scheduled_at = when
+                sched.status = "scheduled"
+                sched.celery_task_id = res.id
+                sched.save(update_fields=["scheduled_at", "status", "celery_task_id"])
+                return
+
+            # else run now
+            res = batch_upgrade_operation.delay(str(batch.pk), firmwareless)
+            sched.scheduled_at = None
+            sched.status = "running"
+            sched.celery_task_id = res.id
+            sched.started_at = timezone.now()
+            sched.save(update_fields=["scheduled_at", "status", "celery_task_id", "started_at"])
+
+        transaction.on_commit(_enqueue)
         return batch
+
 
     def _find_related_device_firmwares(self, select_devices=False):
         """
@@ -489,7 +529,8 @@ class AbstractDeviceFirmware(TimeStampedEditableModel):
 class AbstractBatchUpgradeOperation(UpgradeOptionsMixin, TimeStampedEditableModel):
     build = models.ForeignKey(get_model_name("Build"), on_delete=models.CASCADE)
     STATUS_CHOICES = (
-        ("idle", _("idle")),
+        # ("idle", _("idle")),
+        ("scheduled", _("scheduled")),
         ("in-progress", _("in progress")),
         ("success", _("completed successfully")),
         ("failed", _("completed with some failures")),
@@ -528,10 +569,24 @@ class AbstractBatchUpgradeOperation(UpgradeOptionsMixin, TimeStampedEditableMode
     def dry_run(build):
         related_device_fw = build._find_related_device_firmwares(select_devices=True)
         firmwareless_devices = build._find_firmwareless_devices()
+
+        # # 🔑 DeviceGroup comes from Category (OpenWISP-style targeting)
+        # device_group = getattr(build.category, "device_group", None)
+
+        # if device_group:
+        #     # IMPORTANT: filter at DB level
+        #     related_device_fw = related_device_fw.filter(
+        #         device__group=device_group
+        #     )
+        #     firmwareless_devices = firmwareless_devices.filter(
+        #         group=device_group
+        #     )
+
         return {
             "device_firmwares": related_device_fw,
             "devices": firmwareless_devices,
         }
+
 
     def upgrade_related_devices(self):
         """
@@ -825,3 +880,37 @@ class AbstractDeviceFirmwareSchedule(TimeStampedEditableModel):
 
     def __str__(self):
         return f"Schedule for device_firmware {self.device_firmware_id}"
+
+class AbstractBatchUpgradeOperationSchedule(TimeStampedEditableModel):
+    """
+    Stores scheduling metadata without modifying BatchUpgradeOperation.
+    """
+    batch_operation = models.OneToOneField(
+        get_model_name("BatchUpgradeOperation"),
+        on_delete=models.CASCADE,
+        related_name="schedule",
+    )
+
+    scheduled_at = models.DateTimeField(null=True, blank=True)
+
+    STATUS_CHOICES = (
+        ("pending", _("pending")),
+        ("scheduled", _("scheduled")),
+        ("running", _("running")),
+        ("success", _("success")),
+        ("failed", _("failed")),
+        ("canceled", _("canceled")),
+    )
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default="pending")
+
+    celery_task_id = models.CharField(max_length=255, blank=True, default="")
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        abstract = True
+        verbose_name = _("Batch Upgrade Operation Schedule")
+        verbose_name_plural = _("Batch Upgrade Operation Schedules")
+
+    def __str__(self):
+        return f"Schedule for batch_operation {self.batch_operation_id}"

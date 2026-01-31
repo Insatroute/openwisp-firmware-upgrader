@@ -48,9 +48,35 @@
   <input type="hidden" name="action" value="upgrade_selected">
   {% if firmwareless_count or related_count %}
   <div>{% if form.errors %}{{ form.errors }} {% endif %}</div>
-  <div class="form-row{% if form.errors.upgrade_options %} errors{% endif %}">
+  {% comment %} <div class="form-row{% if form.errors.upgrade_options %} errors{% endif %}">
     {{ form }}
+  </div> {% endcomment %}
+  {% if form.errors %}{{ form.errors }}{% endif %}
+
+<fieldset class="module aligned">
+  <h2>{% trans "Upgrade options" %}</h2>
+  <div class="form-row{% if form.errors.upgrade_options %} errors{% endif %}">
+    {{ form.upgrade_options.errors }}
+    {{ form.upgrade_options }}
   </div>
+</fieldset>
+
+<fieldset class="module aligned">
+  <h2>{% trans "Schedule" %}</h2>
+  <div class="form-row{% if form.errors.scheduled_at %} errors{% endif %}">
+    {{ form.scheduled_at.errors }}
+    <div>
+      <label>{{ form.scheduled_at.label }}:</label>
+      {{ form.scheduled_at }}
+      {% if form.scheduled_at.help_text %}
+        <div class="help">{{ form.scheduled_at.help_text }}</div>
+      {% endif %}
+    </div>
+  </div>
+</fieldset>
+
+{{ form.build }} {# hidden #}
+
   <input type="submit" name="upgrade_all" value="{% trans "Upgrade all devices" %}">
   {% if firmwareless_count and related_count %}
   <input type="submit" name="upgrade_related" value="{% trans "Upgrade only related devices" %}">
