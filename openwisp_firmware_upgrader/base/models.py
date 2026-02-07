@@ -44,6 +44,7 @@ from ..utils import (
 )
 # from swapper import load_model
 from openwisp_controller.config.models import DeviceGroup
+from openwisp_controller.config.models import Device
 
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,13 @@ class UpgradeOptionsMixin(models.Model):
 
 class AbstractCategory(ShareableOrgMixin, TimeStampedEditableModel):
     name = models.CharField(max_length=64, db_index=True)
+    devices = models.ManyToManyField(
+        Device,
+        blank=True,
+        related_name="firmware_categories",
+        verbose_name=_("Devices"),
+        help_text=_("Select the devices included in this category for mass upgrade."),
+    )
     description = models.TextField(blank=True)
     # device_group = models.ForeignKey(
     #     DeviceGroup,
