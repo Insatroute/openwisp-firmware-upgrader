@@ -27,6 +27,8 @@ from reversion.admin import VersionAdmin
 
 from openwisp_controller.config.admin import DeactivatedDeviceReadOnlyMixin, DeviceAdmin
 from openwisp_users.multitenancy import MultitenantAdminMixin, MultitenantOrgFilter
+from django.contrib.admin.views.decorators import staff_member_required
+
 from openwisp_utils.admin import ReadOnlyAdmin, TimeReadonlyAdminMixin
 from openwisp_firmware_upgrader.tasks import batch_upgrade_operation
 from .filters import (
@@ -972,7 +974,14 @@ class DeviceUpgradeOperationInline(ReadonlyUpgradeOptionsMixin, UpgradeOperation
     sortable_options = {"disabled": True}
     can_delete = True
     extra = 0
-    
+
+    class Media:
+        js = [
+            "admin/js/jquery.init.js",
+            "firmware-upgrader/js/upgrade-auto-refresh.js",
+        ]
+        css = {"all": ["firmware-upgrader/css/upgrade-options.css"]}
+
     fields = [
         "device",
         "image",
