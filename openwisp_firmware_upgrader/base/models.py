@@ -837,21 +837,46 @@ class AbstractUpgradeOperation(UpgradeOptionsMixin, TimeStampedEditableModel):
         return get_upgrader_class_for_device(self.device)
 
     @property
+    def firmware_size(self):
+        """Total firmware file size in bytes, 0 if unavailable."""
+        if self.image and self.image.file:
+            try:
+                return self.image.file.size
+            except (OSError, ValueError):
+                return 0
+        return 0
+
+    @property
+    def uploaded_bytes(self):
+        """
+        Estimated bytes uploaded based on firmware size and elapsed time.
+        Formula: uploaded = total_size * (elapsed / estimated_duration)
+        Larger files get a proportionally longer estimated duration,
+        so progress moves slower for bigger firmware.
+        """
+        total = self.firmware_size
+        if total <= 0 or self.status != "in-progress":
+            return total if self.status in ("success", "failed", "aborted") else 0
+        elapsed = max((now() - self.created).total_seconds(), 0)
+        # ~60 seconds per MB baseline (upload + flash + reboot)
+        estimated_seconds = max((total / 1048576) * 60, 30)
+        ratio = min(elapsed / estimated_seconds, 0.95)
+        return int(total * ratio)
+
+    @property
     def progress(self):
-        # ✅ scheduled => no progress yet
+        """progress = (uploaded_bytes / total_firmware_size) * 100"""
         if self.status == "scheduled":
             return 0
-
-        if self.status == "in-progress":
-            elapsed = (now() - self.modified).total_seconds()
-            step = int(elapsed // 20)
-            percent = min(20 + step * 10, 70)
-            return percent
-        if self.status == "success":
+        if self.status in ("success", "failed", "aborted"):
             return 100
-        if self.status in ("failed", "aborted"):
-            return 100
-        return 0
+        if self.status != "in-progress":
+            return 0
+        total = self.firmware_size
+        if total <= 0:
+            return 1
+        uploaded = self.uploaded_bytes
+        return max(1, min(int((uploaded / total) * 100), 95))
 
 class AbstractDeviceFirmwareSchedule(TimeStampedEditableModel):
     """

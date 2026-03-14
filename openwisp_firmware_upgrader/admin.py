@@ -986,7 +986,7 @@ class DeviceUpgradeOperationInline(ReadonlyUpgradeOptionsMixin, UpgradeOperation
         "device",
         "image",
         "status",
-        # "progress_display",
+        "progress_display",
         "scheduled_at_display",
         "log",
         "readonly_upgrade_options",
@@ -1067,33 +1067,97 @@ class DeviceUpgradeOperationInline(ReadonlyUpgradeOptionsMixin, UpgradeOperation
             return self.get_queryset(request, select_related=False).exists()
         return False
     
+    @staticmethod
+    def _format_size(size_bytes):
+        """Format bytes into human-readable size string."""
+        if size_bytes >= 1048576:
+            return f"{size_bytes / 1048576:.1f} MB"
+        if size_bytes >= 1024:
+            return f"{size_bytes / 1024:.1f} KB"
+        return f"{size_bytes} B"
+
     @admin.display(description="Progress")
     def progress_display(self, obj):
         if obj.status == "scheduled":
             return "-"
-        percent = obj.progress  # uses your @property
-        # Choose color based on status
+        percent = obj.progress
+        # Bar color and badge per status
         if obj.status == "success":
-            color = "#28a745"  # green
+            bar_bg = "background:linear-gradient(90deg,#22c55e,#16a34a)"
+            badge_style = "background:#dcfce7;color:#166534"
+            badge_text = "completed"
         elif obj.status == "in-progress":
-            color = "#ffc107"  # yellow
+            bar_bg = (
+                "background:linear-gradient(90deg,#f59e0b,#f97316);"
+                "background-size:20px 20px;"
+                "background-image:linear-gradient(-45deg,"
+                "rgba(255,255,255,.18) 25%,transparent 25%,"
+                "transparent 50%,rgba(255,255,255,.18) 50%,"
+                "rgba(255,255,255,.18) 75%,transparent 75%,transparent);"
+                "animation:fw-stripe .8s linear infinite"
+            )
+            badge_style = "background:#fef3c7;color:#92400e"
+            badge_text = "uploading"
         elif obj.status in ("failed", "aborted"):
-            color = "#dc3545"  # red
+            bar_bg = "background:linear-gradient(90deg,#ef4444,#dc2626)"
+            badge_style = "background:#fee2e2;color:#991b1b"
+            badge_text = obj.status
         else:
-            color = "#6c757d"  # gray
-
-        return format_html(
-            """
-            <div style="width:200px; background:#e9ecef; border-radius:6px; overflow:hidden; box-shadow: inset 0 1px 2px rgba(0,0,0,.1);">
-                <div style="width: {}%; background:{}; color:#fff; text-align:center; padding:2px 0; font-size:12px; font-weight:bold;">
-                    {}%
-                </div>
-            </div>
-            """,
-            percent,
-            color,
-            percent,
+            bar_bg = "background:#6c757d"
+            badge_style = "background:#f3f4f6;color:#6b7280"
+            badge_text = obj.status
+        # Use model properties for real size-based progress:
+        # progress = (uploaded_bytes / firmware_size) * 100
+        total_bytes = obj.firmware_size
+        uploaded_bytes = obj.uploaded_bytes
+        remaining_bytes = max(total_bytes - uploaded_bytes, 0)
+        size_text = ""
+        if total_bytes > 0:
+            uploaded_str = self._format_size(uploaded_bytes)
+            total_str = self._format_size(total_bytes)
+            remaining_str = self._format_size(remaining_bytes)
+            if obj.status == "in-progress":
+                size_text = f'{uploaded_str} / {total_str} &mdash; {remaining_str} remaining'
+            elif obj.status == "success":
+                size_text = f'{total_str} uploaded'
+            else:
+                size_text = f'{uploaded_str} / {total_str}'
+        # Build single horizontal row: [bar] [percent] [size] [badge]
+        html = (
+            f'<style>'
+            f'@keyframes fw-stripe{{'
+            f'from{{background-position:0 0}}'
+            f'to{{background-position:20px 0}}'
+            f'}}</style>'
+            f'<div style="display:flex;align-items:center;gap:10px;'
+            f'  flex-wrap:nowrap;white-space:nowrap;">'
+            # Progress bar track
+            f'  <div style="width:400px;min-width:200px;height:18px;'
+            f'    background:#e5e7eb;border-radius:9px;overflow:hidden;'
+            f'    box-shadow:inset 0 2px 4px rgba(0,0,0,.1);">'
+            f'    <div style="height:100%;border-radius:9px;'
+            f'      width:{percent}%;min-width:2px;{bar_bg};'
+            f'      display:flex;align-items:center;justify-content:center;'
+            f'      font-size:10px;font-weight:700;color:#fff;'
+            f'      text-shadow:0 1px 1px rgba(0,0,0,.2);'
+            f'      transition:width .6s cubic-bezier(.4,0,.2,1);">'
+            f'      {"" if percent < 8 else str(percent) + "%"}'
+            f'    </div>'
+            f'  </div>'
+            # Percent text (always visible outside bar)
+            f'  <span style="font-size:12px;font-weight:700;'
+            f'    color:#374151;min-width:36px;">{percent}%</span>'
+            # Size info
+            f'  <span style="font-size:11px;color:#6b7280;">'
+            f'    {size_text}</span>'
+            # Status badge
+            f'  <span style="display:inline-block;padding:2px 8px;'
+            f'    border-radius:10px;font-size:10px;font-weight:700;'
+            f'    text-transform:uppercase;letter-spacing:.5px;'
+            f'    {badge_style};">{badge_text}</span>'
+            f'</div>'
         )
+        return mark_safe(html)
 
 
 
