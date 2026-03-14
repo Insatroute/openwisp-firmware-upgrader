@@ -1088,15 +1088,15 @@ class DeviceUpgradeOperationInline(ReadonlyUpgradeOptionsMixin, UpgradeOperation
             badge_text = "completed"
         elif obj.status == "in-progress":
             bar_bg = (
-                "background:linear-gradient(90deg,#f59e0b,#f97316);"
+                "background:#16a34a;"
                 "background-size:20px 20px;"
                 "background-image:linear-gradient(-45deg,"
-                "rgba(255,255,255,.18) 25%,transparent 25%,"
-                "transparent 50%,rgba(255,255,255,.18) 50%,"
-                "rgba(255,255,255,.18) 75%,transparent 75%,transparent);"
+                "rgba(255,255,255,.25) 25%,transparent 25%,"
+                "transparent 50%,rgba(255,255,255,.25) 50%,"
+                "rgba(255,255,255,.25) 75%,transparent 75%,transparent);"
                 "animation:fw-stripe .8s linear infinite"
             )
-            badge_style = "background:#fef3c7;color:#92400e"
+            badge_style = "background:#dcfce7;color:#166534"
             badge_text = "uploading"
         elif obj.status in ("failed", "aborted"):
             bar_bg = "background:linear-gradient(90deg,#ef4444,#dc2626)"
@@ -1133,8 +1133,8 @@ class DeviceUpgradeOperationInline(ReadonlyUpgradeOptionsMixin, UpgradeOperation
             f'  flex-wrap:nowrap;white-space:nowrap;">'
             # Progress bar track
             f'  <div style="width:400px;min-width:200px;height:18px;'
-            f'    background:#e5e7eb;border-radius:9px;overflow:hidden;'
-            f'    box-shadow:inset 0 2px 4px rgba(0,0,0,.1);">'
+            f'    background:#d1d5db;border-radius:9px;overflow:hidden;'
+            f'    box-shadow:inset 0 2px 4px rgba(0,0,0,.15);">'
             f'    <div style="height:100%;border-radius:9px;'
             f'      width:{percent}%;min-width:2px;{bar_bg};'
             f'      display:flex;align-items:center;justify-content:center;'
