@@ -1087,6 +1087,7 @@ class DeviceUpgradeOperationInline(ReadonlyUpgradeOptionsMixin, UpgradeOperation
             badge_style = "background:#dcfce7;color:#166534"
             badge_text = "completed"
         elif obj.status == "in-progress":
+            upload_done = obj.firmware_size > 0 and obj.uploaded_bytes >= obj.firmware_size
             bar_bg = (
                 "background:#16a34a;"
                 "background-size:20px 20px;"
@@ -1096,8 +1097,13 @@ class DeviceUpgradeOperationInline(ReadonlyUpgradeOptionsMixin, UpgradeOperation
                 "rgba(255,255,255,.25) 75%,transparent 75%,transparent);"
                 "animation:fw-stripe .8s linear infinite"
             )
-            badge_style = "background:#dcfce7;color:#166534"
-            badge_text = "uploading"
+            if upload_done:
+                badge_style = "background:#dbeafe;color:#1e40af"
+                badge_text = "installing"
+                percent = 100
+            else:
+                badge_style = "background:#dcfce7;color:#166534"
+                badge_text = "uploading"
         elif obj.status in ("failed", "aborted"):
             bar_bg = "background:linear-gradient(90deg,#ef4444,#dc2626)"
             badge_style = "background:#fee2e2;color:#991b1b"
@@ -1117,7 +1123,10 @@ class DeviceUpgradeOperationInline(ReadonlyUpgradeOptionsMixin, UpgradeOperation
             total_str = self._format_size(total_bytes)
             remaining_str = self._format_size(remaining_bytes)
             if obj.status == "in-progress":
-                size_text = f'{uploaded_str} / {total_str} &mdash; {remaining_str} remaining'
+                if remaining_bytes == 0:
+                    size_text = f'{total_str} uploaded'
+                else:
+                    size_text = f'{uploaded_str} / {total_str} &mdash; {remaining_str} remaining'
             elif obj.status == "success":
                 size_text = f'{total_str} uploaded'
             else:

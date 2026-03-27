@@ -849,16 +849,22 @@ class AbstractUpgradeOperation(UpgradeOptionsMixin, TimeStampedEditableModel):
     @property
     def uploaded_bytes(self):
         """
-        Estimated bytes uploaded based on firmware size and elapsed time.
-        Formula: uploaded = total_size * (elapsed / estimated_duration)
-        Larger files get a proportionally longer estimated duration,
-        so progress moves slower for bigger firmware.
+        Returns actual bytes uploaded (from cache, written by SCP progress
+        callback) when available, otherwise falls back to time-based estimate.
         """
         total = self.firmware_size
         if total <= 0 or self.status != "in-progress":
             return total if self.status in ("success", "failed", "aborted") else 0
+        # Try real bytes from cache first
+        try:
+            from django.core.cache import cache
+            cached = cache.get(f"fw_progress:{self.pk}")
+            if cached is not None and cached > 0:
+                return min(cached, total)
+        except Exception:
+            pass
+        # Fallback: time-based estimate
         elapsed = max((now() - self.created).total_seconds(), 0)
-        # ~60 seconds per MB baseline (upload + flash + reboot)
         estimated_seconds = max((total / 1048576) * 60, 30)
         ratio = min(elapsed / estimated_seconds, 0.95)
         return int(total * ratio)

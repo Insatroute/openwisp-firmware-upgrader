@@ -152,7 +152,10 @@ class OpenWrt(object):
         """
         self.check_memory(image_file)
         try:
-            self.connection.connector_instance.upload(image_file, remote_path)
+            operation_id = str(self.upgrade_operation.pk)
+            self.connection.connector_instance.upload(
+                image_file, remote_path, operation_id=operation_id
+            )
         except Exception as e:
             raise RecoverableFailure(str(e))
 
