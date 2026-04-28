@@ -9,6 +9,8 @@
   "use strict";
 
   var _refreshTimer = null;
+  var _initialOrgId = null;
+  var _initialized = false;
 
   function getOrgId($) {
     var v = $("#id_organization").val();
@@ -45,11 +47,22 @@
       return;
     }
 
+    // Collect IDs of currently chosen devices so we can preserve them
+    var chosenIds = {};
+    for (var i = 0; i < to.options.length; i++) {
+      chosenIds[to.options[i].value] = to.options[i].text;
+    }
+
     clearOptions(from);
     clearOptions(to);
 
+    // Re-add chosen devices that still belong to the new org
     results.forEach(function (row) {
-      addOption(from, row.id, row.text);
+      if (chosenIds.hasOwnProperty(row.id)) {
+        addOption(to, row.id, row.text);
+      } else {
+        addOption(from, row.id, row.text);
+      }
     });
 
     resetFilterInputs($);
@@ -97,13 +110,26 @@
       return;
     }
 
-    $("#id_organization")
-      .on("change", function () { debouncedRefresh($); })
-      .on("select2:select", function () { debouncedRefresh($); })
-      .on("select2:clear", function () { debouncedRefresh($); });
+    // Record the initial org value so we can skip the Select2 init event
+    _initialOrgId = getOrgId($);
+    _initialized = false;
 
-    window.addEventListener("load", function () {
-      refreshDevices($);
-    });
+    function onOrgChange() {
+      // Skip the first change event fired by Select2 initialization —
+      // Django's filter_horizontal already has the correct initial state.
+      if (!_initialized) {
+        _initialized = true;
+        var currentOrg = getOrgId($);
+        if (currentOrg === _initialOrgId) {
+          return;
+        }
+      }
+      debouncedRefresh($);
+    }
+
+    $("#id_organization")
+      .on("change", onOrgChange)
+      .on("select2:select", onOrgChange)
+      .on("select2:clear", onOrgChange);
   });
 })();

@@ -301,8 +301,8 @@ class BatchUpgradeConfirmationForm(forms.ModelForm):
 
 @admin.register(load_model("Build"))
 class BuildAdmin(BaseAdmin):
-    list_display = ["__str__", "organization", "category", "created", "modified"]
-    list_filter = [CategoryOrganizationFilter, CategoryFilter]
+    list_display = ["__str__", "organization", "category", "upgrade_type", "created", "modified"]
+    list_filter = [CategoryOrganizationFilter, CategoryFilter, "upgrade_type"]
     list_select_related = ["category", "category__organization"]
     search_fields = ["category__name", "version", "os"]
     ordering = ["-created", "-version"]

@@ -104,6 +104,10 @@ class AbstractCategory(ShareableOrgMixin, TimeStampedEditableModel):
 
 
 class AbstractBuild(TimeStampedEditableModel):
+    UPGRADE_TYPE_CHOICES = (
+        ("full_image", _("Full Image")),
+        ("ipk_package", _("Package Patch")),
+    )
     category = models.ForeignKey(
         get_model_name("Category"),
         on_delete=models.CASCADE,
@@ -112,6 +116,16 @@ class AbstractBuild(TimeStampedEditableModel):
             "if you have different firmware types "
             "eg: (BGP routers, wifi APs, DSL gateways) "
             "create a category for each."
+        ),
+    )
+    upgrade_type = models.CharField(
+        _("upgrade type"),
+        max_length=16,
+        choices=UPGRADE_TYPE_CHOICES,
+        default="full_image",
+        help_text=_(
+            "Full Image: replaces entire firmware. "
+            "Package Patch: installs a software package (no reboot required)."
         ),
     )
     version = models.CharField(max_length=32, db_index=True)
@@ -218,24 +232,30 @@ class AbstractBuild(TimeStampedEditableModel):
     def _find_related_device_firmwares(self, select_devices=False):
         """
         Returns all the DeviceFirmware objects related to the firmware
-        category of this build that have not been installed yet
+        category of this build that have not been installed yet.
+        If the category has specific devices assigned, only those are included.
         """
         related = ["image"]
         if select_devices:
             related.append("device")
-        return (
+        qs = (
             load_model("DeviceFirmware")
             .objects.all()
             .select_related(*related)
             .filter(image__build__category_id=self.category_id)
             .exclude(image__build=self, installed=True)
-            .order_by("-created")
         )
+        # Filter by category.devices if any are assigned
+        category_device_ids = self.category.devices.values_list("pk", flat=True)
+        if category_device_ids.exists():
+            qs = qs.filter(device_id__in=category_device_ids)
+        return qs.order_by("-created")
 
     def _find_firmwareless_devices(self, boards=None):
         """
         Returns devices which have no related DeviceFirmware
-        but that are upgradable to one of the image of this build
+        but that are upgradable to one of the image of this build.
+        If the category has specific devices assigned, only those are included.
         """
         if boards is None:
             boards = []
@@ -248,6 +268,10 @@ class AbstractBuild(TimeStampedEditableModel):
         )
         if self.category.organization_id:
             qs = qs.filter(organization_id=self.category.organization_id)
+        # Filter by category.devices if any are assigned
+        category_device_ids = self.category.devices.values_list("pk", flat=True)
+        if category_device_ids.exists():
+            qs = qs.filter(pk__in=category_device_ids)
         return qs.order_by("-created")
 
 
@@ -283,15 +307,32 @@ class AbstractFirmwareImage(TimeStampedEditableModel):
         unique_together = ("build", "type")
 
     def __str__(self):
-        if hasattr(self, "build") and self.type:
-            return f"{self.build}: {self.get_type_display()}"
+        if hasattr(self, "build"):
+            if self.type:
+                return f"{self.build}: {self.get_type_display()}"
+            if self.is_ipk_package:
+                filename = os.path.basename(self.file.name) if self.file else "package"
+                return f"{self.build}: {filename}"
         return super().__str__()
 
     @property
     def boards(self):
+        if self.is_ipk_package:
+            return ()
         return FIRMWARE_IMAGE_MAP[self.type]["boards"]
 
+    @property
+    def is_ipk_package(self):
+        """Check if this image belongs to an ipk_package build."""
+        try:
+            return self.build.upgrade_type == "ipk_package"
+        except Exception:
+            return False
+
     def clean(self):
+        if self.is_ipk_package:
+            # For .ipk packages, skip type/boards validation
+            return
         self._clean_type()
         try:
             self.boards
@@ -370,6 +411,10 @@ class AbstractDeviceFirmware(TimeStampedEditableModel):
                     'please add one in the section named "Credentials"'
                 )
             )
+
+        # Skip board matching for ipk packages (they are board-agnostic)
+        if self.image.is_ipk_package:
+            return
 
         if self.device.model not in self.image.boards:
             raise ValidationError(_("Device model and image model do not match"))
@@ -525,8 +570,12 @@ class AbstractDeviceFirmware(TimeStampedEditableModel):
         )
         # if device model is defined
         # restrict the images to the ones compatible with it
+        # but always include ipk package images (they are board-agnostic)
         if device.model and device.model in REVERSE_FIRMWARE_IMAGE_MAP:
-            qs = qs.filter(type=REVERSE_FIRMWARE_IMAGE_MAP[device.model])
+            qs = qs.filter(
+                Q(type=REVERSE_FIRMWARE_IMAGE_MAP[device.model])
+                | Q(build__upgrade_type="ipk_package")
+            )
         # if DeviceFirmware instance already exists
         # restrict images to the ones of the same category
         if device_firmware and hasattr(device_firmware, "image"):
@@ -577,19 +626,6 @@ class AbstractBatchUpgradeOperation(UpgradeOptionsMixin, TimeStampedEditableMode
     def dry_run(build):
         related_device_fw = build._find_related_device_firmwares(select_devices=True)
         firmwareless_devices = build._find_firmwareless_devices()
-
-        # # 🔑 DeviceGroup comes from Category (OpenWISP-style targeting)
-        # device_group = getattr(build.category, "device_group", None)
-
-        # if device_group:
-        #     # IMPORTANT: filter at DB level
-        #     related_device_fw = related_device_fw.filter(
-        #         device__group=device_group
-        #     )
-        #     firmwareless_devices = firmwareless_devices.filter(
-        #         group=device_group
-        #     )
-
         return {
             "device_firmwares": related_device_fw,
             "devices": firmwareless_devices,

@@ -194,6 +194,10 @@ class OpenWrt(object):
         self.log(_("Device identity verified successfully"))
 
     def upgrade(self, image):
+        # Check if this is an ipk package install or full sysupgrade
+        build = self.upgrade_operation.image.build
+        if getattr(build, 'upgrade_type', 'full_image') == 'ipk_package':
+            return self.install_package(image)
         self._test_connection()
         self._verify_device_uuid()
         checksum = self._test_checksum(image)
@@ -202,6 +206,47 @@ class OpenWrt(object):
         self._test_image(remote_path)
         self._reflash(remote_path)
         self._write_checksum(checksum)
+
+    def install_package(self, image):
+        """
+        Installs an .ipk package on the device via opkg.
+        No reboot required unlike sysupgrade.
+        """
+        self._test_connection()
+        self._verify_device_uuid()
+        remote_path = self.get_remote_path(image)
+        self.log(_("Uploading package to device..."))
+        self.upload(image.file, remote_path)
+        # Install the package
+        self.log(_("Installing package via opkg..."))
+        output, exit_code = self.exec_command(
+            f"opkg install {remote_path}", exit_codes=[0, 1, 255]
+        )
+        self.log(output, save=False)
+        if exit_code != 0:
+            # Cleanup uploaded file
+            self.exec_command(f"rm -f {remote_path}", raise_unexpected_exit=False)
+            self.disconnect()
+            from ..exceptions import UpgradeAborted
+            self.log(_("Package installation failed with exit code {0}").format(exit_code))
+            raise UpgradeAborted()
+        # Verify installation
+        package_name = os.path.basename(remote_path).split("_")[0]
+        self.log(_("Verifying package installation..."))
+        verify_output, verify_code = self.exec_command(
+            f"opkg list-installed | grep -i {package_name}", exit_codes=[0, 1]
+        )
+        if verify_code == 0 and verify_output.strip():
+            self.log(_("Package '{0}' installed successfully: {1}").format(
+                package_name, verify_output.strip()
+            ))
+        else:
+            self.log(_("Warning: could not verify package installation, "
+                       "but opkg reported success."))
+        # Cleanup
+        self.exec_command(f"rm -f {remote_path}", raise_unexpected_exit=False)
+        self.log(_("Cleanup complete. Package installation finished."))
+        self.disconnect()
 
     def _test_connection(self):
         result = self.connect()
