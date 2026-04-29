@@ -1069,11 +1069,12 @@ class DeviceUpgradeOperationInline(ReadonlyUpgradeOptionsMixin, UpgradeOperation
     
     @staticmethod
     def _format_size(size_bytes):
-        """Format bytes into human-readable size string."""
-        if size_bytes >= 1048576:
-            return f"{size_bytes / 1048576:.1f} MB"
-        if size_bytes >= 1024:
-            return f"{size_bytes / 1024:.1f} KB"
+        """Format bytes into human-readable size string using decimal units
+        (1 MB = 1,000,000 bytes) to match OS file managers and vendor pages."""
+        if size_bytes >= 1_000_000:
+            return f"{size_bytes / 1_000_000:.1f} MB"
+        if size_bytes >= 1_000:
+            return f"{size_bytes / 1_000:.1f} KB"
         return f"{size_bytes} B"
 
     @admin.display(description="Progress")
